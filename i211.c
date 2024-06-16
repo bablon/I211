@@ -80,7 +80,6 @@ struct ring {
 
 	struct circ_buf circ;
 
-	void *desc;
 	dma_addr_t dma;
 	unsigned int size;
 	void __iomem *desc_tail;
@@ -285,9 +284,9 @@ MODULE_DEVICE_TABLE(pci, i211_pci_table);
 
 #define INDEX(i)	((i) & 0xff)
 #define RX_DESC(R, i)	\
-	(&(((union adv_rx_desc *)((R)->desc))[i]))
+	(&(((union adv_rx_desc *)((R)->circ.buf))[i]))
 #define TX_DESC(R, i)	\
-	(&(((union adv_tx_desc *)((R)->desc))[i]))
+	(&(((union adv_tx_desc *)((R)->circ.buf))[i]))
 #define TXD_DCMD (ADVTXD_DCMD_EOP | ADVTXD_DCMD_RS)
 
 /* Additional Receive Descriptor Control definitions */
@@ -1486,10 +1485,9 @@ static void free_rx_resources(struct ring *ring)
 		vfree(ring->rx_buffer);
 	}
 	ring->rx_buffer = NULL;
-	if (ring->desc) {
-		dma_free_coherent(ring->dev, ring->size, ring->desc, ring->dma);
+	if (ring->circ.buf) {
+		dma_free_coherent(ring->dev, ring->size, ring->circ.buf, ring->dma);
 	}
-	ring->desc = NULL;
 }
 
 static int setup_tx_resources(struct ring *ring)
@@ -1498,12 +1496,11 @@ static int setup_tx_resources(struct ring *ring)
 
 	ring->size = 256 * sizeof(union adv_tx_desc);
 	ring->size = ALIGN(ring->size, 4096);
-	ring->desc = dma_alloc_coherent(ring->dev, ring->size, &ring->dma, GFP_KERNEL);
+	ring->circ.buf = dma_alloc_coherent(ring->dev, ring->size, &ring->dma, GFP_KERNEL);
 	ring->circ.head = 0;
 	ring->circ.tail = 0;
-	ring->circ.buf = ring->desc;
 	ring->count = 256;
-	if (!ring->tx_buffer || !ring->desc) {
+	if (!ring->tx_buffer || !ring->circ.buf) {
 		dev_err(ring->dev, "queue tx%d: tx alloc error\n", ring->queue_index);
 	}
 
@@ -1517,10 +1514,9 @@ static void free_tx_resources(struct ring *ring)
 		vfree(ring->tx_buffer);
 	}
 	ring->tx_buffer = NULL;
-	if (ring->desc) {
-		dma_free_coherent(ring->dev, ring->size, ring->desc, ring->dma);
+	if (ring->circ.buf) {
+		dma_free_coherent(ring->dev, ring->size, ring->circ.buf, ring->dma);
 	}
-	ring->desc = NULL;
 }
 
 static int setup_all_tx_resources(struct adapter *adap)
@@ -1574,16 +1570,15 @@ static int setup_rx_resources(struct ring *ring)
 	ring->size = 256 * sizeof(union adv_rx_desc);
 	ring->size = ALIGN(ring->size, 4096);
 
-	ring->desc = dma_alloc_coherent(ring->dev, ring->size, &ring->dma, GFP_KERNEL);
+	ring->circ.buf = dma_alloc_coherent(ring->dev, ring->size, &ring->dma, GFP_KERNEL);
 	ring->rx_buffer = vmalloc(256 * sizeof(struct rx_buffer));
 
-	ring->circ.buf = ring->desc;
 	ring->circ.head = 0;
 	ring->circ.tail = 0;
 
 	ring->count = 256;
 
-	if (!ring->rx_buffer || !ring->desc) {
+	if (!ring->rx_buffer || !ring->circ.buf) {
 		dev_err(ring->dev, "queue rx%d: rx alloc error\n", ring->queue_index);
 	}
 
@@ -1876,7 +1871,7 @@ static int i211_close(struct net_device *netdev)
 #define ADVTXD_MSS_SHIFT      16  /* Adv ctxt MSS shift */
 
 #define TX_CTXTDESC(R, i)	\
-	(&(((struct adv_tx_context_desc *)((R)->desc))[i]))
+	(&(((struct adv_tx_context_desc *)((R)->circ.buf))[i]))
 
 static void tx_ctxtdesc(struct ring *ring, struct tx_buffer *first,
 			u32 vlan_macip_lens, u32 type_tucmd, u32 mss_l4len_idx)
