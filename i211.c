@@ -20,6 +20,7 @@
 #include <linux/mii.h>
 #include <linux/phy.h>
 #include <linux/version.h>
+#include <linux/circ_buf.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 #include <net/page_pool.h>
 #else
@@ -77,15 +78,14 @@ struct ring {
 
 	struct page_pool *page_pool;
 
+	struct circ_buf circ;
+
 	void *desc;
 	dma_addr_t dma;
 	unsigned int size;
 	void __iomem *desc_tail;
 	int reg_idx;
 	int queue_index;
-
-	u64 head, tail;
-	u64 alloc;
 
 	u16 count;
 	char name[4];
@@ -228,24 +228,6 @@ enum adapter_state {
 	STATE_DOWN,
 };
 
-#define FLAG_HAS_MSI			BIT(0)
-#define FLAG_DCA_ENABLED		BIT(1)
-#define FLAG_QUAD_PORT_A		BIT(2)
-#define FLAG_QUEUE_PAIRS		BIT(3)
-#define FLAG_DMAC			BIT(4)
-#define FLAG_RSS_FIELD_IPV4_UDP		BIT(6)
-#define FLAG_RSS_FIELD_IPV6_UDP		BIT(7)
-#define FLAG_WOL_SUPPORTED		BIT(8)
-#define FLAG_NEED_LINK_UPDATE		BIT(9)
-#define FLAG_MEDIA_RESET		BIT(10)
-#define FLAG_MAS_CAPABLE		BIT(11)
-#define FLAG_MAS_ENABLE			BIT(12)
-#define FLAG_HAS_MSIX			BIT(13)
-#define FLAG_EEE			BIT(14)
-#define FLAG_VLAN_PROMISC		BIT(15)
-#define FLAG_RX_LEGACY			BIT(16)
-#define FLAG_FQTSS			BIT(17)
-
 struct adapter {
 	struct net_device *netdev;
 	struct pci_dev *pdev;
@@ -335,7 +317,22 @@ static inline u32 i211_read_array(struct adapter *adap, u32 reg, u32 off)
 
 static inline int i211_desc_unused(struct ring *ring)
 {
-	return (ring->count - 1 - (ring->tail - ring->head));
+	return CIRC_SPACE(ring->circ.head, ring->circ.tail, ring->count);
+}
+
+static inline void ring_head_inc(struct ring *ring)
+{
+	ring->circ.head = (ring->circ.head + 1) & (ring->count - 1);
+}
+
+static inline void ring_head_dec(struct ring *ring)
+{
+	ring->circ.head = (ring->circ.head - 1) & (ring->count - 1);
+}
+
+static inline void ring_tail_inc(struct ring *ring)
+{
+	ring->circ.tail = (ring->circ.tail + 1) & (ring->count - 1);
 }
 
 static inline struct netdev_queue *txring_txq(const struct ring *tx_ring)
@@ -960,16 +957,16 @@ static void alloc_rx_buffers(struct ring *rx_ring, u16 cleaned_count)
 {
 	union adv_rx_desc *rx_desc;
 	struct rx_buffer *bi;
-	u64 tail = rx_ring->tail;
-	u16 i = INDEX(rx_ring->tail);
+	struct circ_buf *circ = &rx_ring->circ;
+	int head = circ->head;
 	u16 bufsz;
 
 	/* nothing to do */
 	if (!cleaned_count)
 		return;
 
-	rx_desc = RX_DESC(rx_ring, i);
-	bi = &rx_ring->rx_buffer[i];
+	rx_desc = RX_DESC(rx_ring, circ->head);
+	bi = &rx_ring->rx_buffer[circ->head];
 
 	bufsz = 1536;
 
@@ -979,26 +976,18 @@ static void alloc_rx_buffers(struct ring *rx_ring, u16 cleaned_count)
 
 		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
 
-		i = INDEX(++tail);
-		rx_desc = RX_DESC(rx_ring, i);
-		bi = rx_ring->rx_buffer + i;
+		ring_head_inc(rx_ring);
+
+		rx_desc = RX_DESC(rx_ring, circ->head);
+		bi = rx_ring->rx_buffer + circ->head;
 
 		rx_desc->wb.upper.length = 0;
 
 		cleaned_count--;
 	} while (cleaned_count);
 
-	if (rx_ring->tail != tail) {
-		rx_ring->tail = tail;
-
-		/* Force memory writes to complete before letting h/w
-		 * know there are new descriptors to fetch.  (Only
-		 * applicable for weak-ordered memory model archs,
-		 * such as IA-64).
-		 */
-		dma_wmb();
-		writel(i, rx_ring->desc_tail);
-	}
+	if (circ->head != head)
+		writel(circ->head, rx_ring->desc_tail);
 }
 
 #define TXDCTL_QUEUE_ENABLE  0x02000000 /* Enable specific Tx Queue */
@@ -1035,11 +1024,10 @@ static int clean_tx_irq(struct qvector *q, int napi_budget)
 	union adv_tx_desc *tx_desc;
 	unsigned int total_bytes = 0, total_packets = 0;
 	unsigned int budget = 128;
-	u64 head = tx_ring->head;
-	int i = INDEX(head);
+	struct circ_buf *circ = &tx_ring->circ;
 
-	tx_buffer = &tx_ring->tx_buffer[i];
-	tx_desc = TX_DESC(tx_ring, i);
+	tx_buffer = &tx_ring->tx_buffer[circ->tail];
+	tx_desc = TX_DESC(tx_ring, circ->tail);
 
 	do {
 		union adv_tx_desc *eop_desc = tx_buffer->next_to_watch;
@@ -1072,9 +1060,9 @@ static int clean_tx_irq(struct qvector *q, int napi_budget)
 		dma_unmap_len_set(tx_buffer, len, 0);
 
 		while (tx_desc != eop_desc) {
-			i = INDEX(++head);
-			tx_buffer = tx_ring->tx_buffer + i;
-			tx_desc = TX_DESC(tx_ring, i);
+			ring_tail_inc(tx_ring);
+			tx_buffer = tx_ring->tx_buffer + circ->tail;
+			tx_desc = TX_DESC(tx_ring, circ->tail);
 
 			/* unmap any remaining paged data */
 			if (dma_unmap_len(tx_buffer, len)) {
@@ -1087,9 +1075,9 @@ static int clean_tx_irq(struct qvector *q, int napi_budget)
 		}
 
 		/* move us one more past the eop_desc for start of next pkt */
-		i = INDEX(++head);
-		tx_buffer = tx_ring->tx_buffer + i;
-		tx_desc = TX_DESC(tx_ring, i);
+		ring_tail_inc(tx_ring);
+		tx_buffer = tx_ring->tx_buffer + circ->tail;
+		tx_desc = TX_DESC(tx_ring, circ->tail);
 
 		/* issue prefetch for next Tx descriptor */
 		prefetch(tx_desc);
@@ -1097,8 +1085,6 @@ static int clean_tx_irq(struct qvector *q, int napi_budget)
 		/* update budget accounting */
 		budget--;
 	} while (likely(budget));
-
-	tx_ring->head = head;
 
 	__netif_txq_completed_wake(txring_txq(tx_ring), total_packets,
 			total_bytes, i211_desc_unused(tx_ring), DESC_NEEDED, false);
@@ -1142,7 +1128,8 @@ static inline __le32 i211_test_staterr(union adv_rx_desc *rx_desc, const u32 sta
 
 static bool i211_is_non_eop(struct ring *rx_ring, union adv_rx_desc *rx_desc)
 {
-	prefetch(RX_DESC(rx_ring, INDEX(++rx_ring->head)));
+	ring_tail_inc(rx_ring);
+	prefetch(RX_DESC(rx_ring, rx_ring->circ.tail));
 
 	if (likely(i211_test_staterr(rx_desc, RXD_STAT_EOP)))
 		return false;
@@ -1234,12 +1221,12 @@ static int clean_rx_irq(struct qvector *q, int budget)
 		u32 size;
 		struct rx_buffer *rxbuf;
 
-		desc = RX_DESC(ring, INDEX(ring->head));
+		desc = RX_DESC(ring, ring->circ.tail);
 		size = le16_to_cpu(desc->wb.upper.length);
 		if (!size)
 			break;
 
-		rxbuf = ring->rx_buffer + INDEX(ring->head);
+		rxbuf = ring->rx_buffer + ring->circ.tail;
 
 		dma_sync_single_range_for_cpu(ring->dev, rxbuf->dma, rxbuf->page_offset, size, DMA_FROM_DEVICE);
 		if (!skb) {
@@ -1280,7 +1267,7 @@ static int clean_rx_irq(struct qvector *q, int budget)
 		 ring->name, total_packets, total_bytes);
 
 	if (cleaned_count)
-		alloc_rx_buffers(ring, count);
+		alloc_rx_buffers(ring, cleaned_count);
 
 	return count;
 }
@@ -1432,10 +1419,10 @@ static void free_msix_irq(struct adapter *adap)
 
 static void clean_tx_ring(struct ring *tx_ring)
 {
-	u16 i = INDEX(tx_ring->head);
-	struct tx_buffer *tx_buffer = &tx_ring->tx_buffer[i];
+	struct circ_buf *circ = &tx_ring->circ;
+	struct tx_buffer *tx_buffer = &tx_ring->tx_buffer[circ->tail];
 
-	while (tx_ring->head != tx_ring->tail) {
+	while (circ->head != circ->tail) {
 		union adv_tx_desc *eop_desc, *tx_desc;
 
 		/* Free all the Tx ring sk_buffs or xdp frames */
@@ -1449,13 +1436,13 @@ static void clean_tx_ring(struct ring *tx_ring)
 
 		/* check for eop_desc to determine the end of the packet */
 		eop_desc = tx_buffer->next_to_watch;
-		tx_desc = TX_DESC(tx_ring, i);
+		tx_desc = TX_DESC(tx_ring, circ->tail);
 
 		/* unmap remaining buffers */
 		while (tx_desc != eop_desc) {
-			i = INDEX(++tx_ring->head);
-			tx_buffer = tx_ring->tx_buffer + i;
-			tx_desc = TX_DESC(tx_ring, i);
+			ring_tail_inc(tx_ring);
+			tx_buffer = tx_ring->tx_buffer + circ->tail;
+			tx_desc = TX_DESC(tx_ring, circ->tail);
 
 			/* unmap any remaining paged data */
 			if (dma_unmap_len(tx_buffer, len))
@@ -1467,35 +1454,28 @@ static void clean_tx_ring(struct ring *tx_ring)
 
 		tx_buffer->next_to_watch = NULL;
 
-		/* move us one more past the eop_desc for start of next pkt */
-		i = INDEX(++tx_ring->head);
-		tx_buffer = tx_ring->tx_buffer + i;
+		ring_tail_inc(tx_ring);
+		tx_buffer = tx_ring->tx_buffer + circ->tail;
 	}
 
 	/* reset BQL for queue */
 	netdev_tx_reset_queue(txring_txq(tx_ring));
-
-	tx_ring->head = 0;
-	tx_ring->tail = 0;
 }
 
 static void clean_rx_buffers(struct ring *rx_ring)
 {
-	u16 i = INDEX(rx_ring->head);
+	struct circ_buf *circ = &rx_ring->circ;
 
 	dev_kfree_skb(rx_ring->skb);
 	rx_ring->skb = NULL;
 
-	while (rx_ring->head != rx_ring->tail) {
-		struct rx_buffer *buffer_info = &rx_ring->rx_buffer[i];
+	while (circ->head != circ->tail) {
+		struct rx_buffer *buffer_info = &rx_ring->rx_buffer[circ->tail];
 
 		page_pool_put_full_page(rx_ring->page_pool, buffer_info->page, true);
 
-		i = INDEX(++rx_ring->head);
+		ring_tail_inc(rx_ring);
 	}
-
-	rx_ring->head = 0;
-	rx_ring->tail = 0;
 }
 
 static void free_rx_resources(struct ring *ring)
@@ -1519,8 +1499,9 @@ static int setup_tx_resources(struct ring *ring)
 	ring->size = 256 * sizeof(union adv_tx_desc);
 	ring->size = ALIGN(ring->size, 4096);
 	ring->desc = dma_alloc_coherent(ring->dev, ring->size, &ring->dma, GFP_KERNEL);
-	ring->head = 0;
-	ring->tail = 0;
+	ring->circ.head = 0;
+	ring->circ.tail = 0;
+	ring->circ.buf = ring->desc;
 	ring->count = 256;
 	if (!ring->tx_buffer || !ring->desc) {
 		dev_err(ring->dev, "queue tx%d: tx alloc error\n", ring->queue_index);
@@ -1595,8 +1576,10 @@ static int setup_rx_resources(struct ring *ring)
 
 	ring->desc = dma_alloc_coherent(ring->dev, ring->size, &ring->dma, GFP_KERNEL);
 	ring->rx_buffer = vmalloc(256 * sizeof(struct rx_buffer));
-	ring->head = 0;
-	ring->tail = 0;
+
+	ring->circ.buf = ring->desc;
+	ring->circ.head = 0;
+	ring->circ.tail = 0;
 
 	ring->count = 256;
 
@@ -1899,11 +1882,10 @@ static void tx_ctxtdesc(struct ring *ring, struct tx_buffer *first,
 			u32 vlan_macip_lens, u32 type_tucmd, u32 mss_l4len_idx)
 {
 	struct adv_tx_context_desc *context_desc;
-	u16 i = INDEX(ring->tail);
 
-	context_desc = TX_CTXTDESC(ring, i);
+	context_desc = TX_CTXTDESC(ring, ring->circ.head);
 
-	ring->tail++;
+	ring_head_inc(ring);
 
 	/* set bits to identify this as an advanced context descriptor */
 	type_tucmd |= TXD_CMD_DEXT | ADVTXD_DTYP_CTXT;
@@ -1988,11 +1970,10 @@ static int tx_map(struct ring *tx_ring, struct tx_buffer *first, const u8 hdr_le
 	dma_addr_t dma;
 	unsigned int data_len, size;
 	u32 cmd_type = tx_cmd_type(skb, first->flags);
-	int i = INDEX(tx_ring->tail);
-	u64 tail = tx_ring->tail;
+	struct circ_buf *circ = &tx_ring->circ;
 	bool doorbell, stop;
 
-	tx_desc = TX_DESC(tx_ring, i);
+	tx_desc = TX_DESC(tx_ring, circ->head);
 
 	tx_olinfo_status(tx_ring, tx_desc, first->flags, skb->len - hdr_len);
 
@@ -2020,17 +2001,16 @@ static int tx_map(struct ring *tx_ring, struct tx_buffer *first, const u8 hdr_le
 
 		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type ^ size);
 
-		i = INDEX(++tail);
-		tx_desc = TX_DESC(tx_ring, i);
+		ring_head_inc(tx_ring);
+		tx_desc = TX_DESC(tx_ring, circ->head);
 		tx_desc->read.olinfo_status = 0;
 
 		size = skb_frag_size(frag);
 		data_len -= size;
 
-		dma = skb_frag_dma_map(tx_ring->dev, frag, 0,
-				       size, DMA_TO_DEVICE);
+		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size, DMA_TO_DEVICE);
 
-		tx_buffer = &tx_ring->tx_buffer[i];
+		tx_buffer = &tx_ring->tx_buffer[circ->head];
 	}
 
 	/* write last descriptor with RS and EOP bits */
@@ -2056,21 +2036,19 @@ static int tx_map(struct ring *tx_ring, struct tx_buffer *first, const u8 hdr_le
 
 	first->next_to_watch = tx_desc;
 
-	i = INDEX(++tail);
-
-	tx_ring->tail = tail;
+	ring_head_inc(tx_ring);
 
 	stop = !netif_txq_maybe_stop(txring_txq(tx_ring),
 			i211_desc_unused(tx_ring), DESC_NEEDED, DESC_NEEDED);
 
 	if (stop || doorbell)
-		writel(i, tx_ring->desc_tail);
+		writel(circ->head, tx_ring->desc_tail);
 
 	return 0;
 
 dma_error:
 	dev_err(tx_ring->dev, "TX DMA map failed\n");
-	tx_buffer = &tx_ring->tx_buffer[i];
+	tx_buffer = &tx_ring->tx_buffer[circ->head];
 
 	/* clear dma mappings for failed tx_buffer_info map */
 	while (tx_buffer != first) {
@@ -2081,8 +2059,8 @@ dma_error:
 				       DMA_TO_DEVICE);
 		dma_unmap_len_set(tx_buffer, len, 0);
 
-		i = INDEX(--tail);
-		tx_buffer = &tx_ring->tx_buffer[i];
+		ring_head_dec(tx_ring);
+		tx_buffer = &tx_ring->tx_buffer[tx_ring->circ.head];
 	}
 
 	if (dma_unmap_len(tx_buffer, len))
@@ -2211,7 +2189,7 @@ static netdev_tx_t i211_xmit_frame(struct sk_buff *skb, struct net_device *netde
 	if (unused < (count + 3))
 		return NETDEV_TX_BUSY;
 
-	first = ring->tx_buffer + INDEX(ring->tail);
+	first = ring->tx_buffer + ring->circ.head;
 	first->skb = skb;
 	first->bytecount = skb->len;
 	first->gso_segs = 1;
